@@ -1,0 +1,1289 @@
+diff --git a/.gitignore b/.gitignore
+index 312b82d..fb4db0d 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -23,3 +23,6 @@ tx_log.txt
+ 
+ # Python bytecode from the gnuradio analysis scripts
+ __pycache__/
++# Optional Pluto Python environment and test caches.
++.venv-pluto/
++*.pyc
+diff --git a/Cargo.toml b/Cargo.toml
+index a6983cf..1339e0d 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3,7 +3,7 @@ name = "gui_sdr_gps_sim"
+ version = "0.2.1"
+ authors = ["Okiedocus"]
+ edition = "2024"
+-include = ["LICENSE", "**/*.rs", "Cargo.toml"]
++include = ["LICENSE", "**/*.rs", "src/gps_sim/pluto_bridge.py", "Cargo.toml"]
+ license = "GPL-3.0-or-later"
+ rust-version = "1.88"
+ 
+diff --git a/README.md b/README.md
+index 7df0bdf..36c70e3 100644
+--- a/README.md
++++ b/README.md
+@@ -4,7 +4,7 @@ This project is a **work in progress**. It has not been thoroughly tested across
+ 
+ # GUI SDR GPS Simulator
+ 
+-A cross-platform desktop application for **generating and transmitting realistic GNSS signals** via a HackRF One software-defined radio. It supports **GPS L1 C/A**, **BeiDou B1C**, and **Galileo E1** — all three share the 1575.42 MHz carrier and are combined into a single IQ stream. It includes a full route creation toolset so you can simulate a receiver moving along any path in the world — a city walk, a car journey, a flight — and feed that signal to real GNSS hardware.
++A cross-platform desktop application for **generating and transmitting realistic GNSS signals** via a HackRF One or ADALM-Pluto software-defined radio. It supports **GPS L1 C/A**, **BeiDou B1C**, and **Galileo E1** — all three share the 1575.42 MHz carrier and are combined into a single IQ stream. It includes a full route creation toolset so you can simulate a receiver moving along any path in the world — a city walk, a car journey, a flight — and feed that signal to real GNSS hardware.
+ Based on and inspired by https://github.com/osqzss/gps-sdr-sim.git and https://github.com/Mictronics/multi-sdr-gps-sim.git
+ 
+ Built in Rust using [egui](https://github.com/emilk/egui) / [eframe](https://github.com/emilk/egui). Runs natively on **Windows, Linux, and macOS**.
+@@ -69,6 +69,7 @@ The goal is a polished, easy-to-use desktop application — not just a command-l
+ | **Waypoint manager** | Store, organise, filter, and reuse named geographic coordinates |
+ | **Route library** | Browse, preview, edit, and delete generated routes |
+ | **HackRF output** | Transmit directly via a connected HackRF One |
++| **ADALM-Pluto output** | Optional pyadi-iio/libiio backend with device URI, Python and TX gain settings; see [Pluto setup](docs/PLUTO.md) |
+ | **IQ file output** | Save raw 8-bit IQ samples to a binary file for offline use |
+ | **UDP / TCP streaming** | Stream IQ samples over the network for GNU Radio or other tools |
+ | **RINEX download** | Download today's broadcast ephemeris automatically from NASA CDDIS |
+@@ -80,7 +81,7 @@ The goal is a polished, easy-to-use desktop application — not just a command-l
+ 
+ | Item | Details |
+ |---|---|
+-| **HackRF One** | Required for RF transmission. [Great Scott Gadgets](https://greatscottgadgets.com/hackrf/) or compatible clone. |
++| **HackRF One or ADALM-Pluto** | Required for RF transmission. HackRF remains the default; Pluto requires the optional [runtime setup](docs/PLUTO.md). |
+ | GPS receiver | Any device you want to test — u-blox modules, handheld GPS units, smartphones (in a shielded enclosure) |
+ | RF attenuator + cable | Recommended for direct connection between HackRF and GPS receiver (30–40 dB attenuation typical) |
+ | Shielded enclosure | Required for safe, legal use — prevents the signal leaking outside your test setup |
+@@ -95,6 +96,10 @@ The HackRF driver must be accessible without administrator / root privileges:
+ 
+ ## Software requirements
+ 
++ADALM-Pluto output additionally requires Python, NumPy, `pyadi-iio` and native
++libiio at runtime. Other outputs do not require Python. See [Pluto setup and
++hardware-free tests](docs/PLUTO.md). No extra Cargo feature is required.
++
+ | Requirement | Notes |
+ |---|---|
+ | **Rust 1.88** | Installed automatically via `rustup` — the `rust-toolchain` file in the repo handles this |
+@@ -289,9 +294,15 @@ All three signals share the 1575.42 MHz carrier and are summed into the same 8-b
+ 
+ ### SDR output options
+ 
++Choose **ADALM-Pluto** to configure a libiio device URI, Python executable, TX
++gain and timeout. Shared RF settings set the sample rate, centre frequency and
++filter bandwidth for Pluto. HackRF VGA/amp controls apply only to HackRF.
++See [Pluto setup](docs/PLUTO.md) for dependencies and known test limitations.
++
+ | Output | Description |
+ |---|---|
+ | **HackRF** (default) | Transmit via a connected HackRF One. Uses the TX VGA gain and amp settings above. |
++| **ADALM-Pluto** | Transmit fresh non-cyclic IQ buffers through pyadi-iio/libiio; supports explicit IP/USB device URIs. |
+ | **IQ File** | Write raw signed 8-bit interleaved IQ samples to a binary file (`[I0, Q0, I1, Q1, …]`). |
+ | **UDP stream** | Stream IQ bytes to a UDP destination (e.g. `127.0.0.1:4567`). Packets are 32 768 bytes. |
+ | **TCP server** | Open a TCP server on the specified port. The app waits for a client, then streams IQ bytes continuously. |
+diff --git a/src/app/mod.rs b/src/app/mod.rs
+index 3c00796..189f881 100644
+--- a/src/app/mod.rs
++++ b/src/app/mod.rs
+@@ -357,6 +357,10 @@ pub struct MyApp {
+     #[serde(skip)]
+     pub sim_output_type: crate::simulator::SimOutputType,
+ 
++    /// Pluto runtime configuration (not persisted).
++    #[serde(skip)]
++    pub sim_pluto: crate::gps_sim::PlutoConfig,
++
+     /// Path for IQ file output (not persisted).
+     #[serde(skip)]
+     pub sim_iq_file_path: String,
+@@ -587,6 +591,7 @@ impl Default for MyApp {
+             sim_log_enable: false,
+             sim_log_path: String::new(),
+             sim_output_type: crate::simulator::SimOutputType::HackRf,
++            sim_pluto: crate::gps_sim::PlutoConfig::default(),
+             sim_iq_file_path: "output.iq".to_owned(),
+             sim_udp_addr: "127.0.0.1:4567".to_owned(),
+             sim_tcp_port: 4567,
+diff --git a/src/app/simulation.rs b/src/app/simulation.rs
+index c35c77b..a94eaeb 100644
+--- a/src/app/simulation.rs
++++ b/src/app/simulation.rs
+@@ -114,6 +114,7 @@ impl MyApp {
+                 }
+             }),
+             output_type: self.sim_output_type.clone(),
++            pluto: self.sim_pluto.clone(),
+             iq_file_path: self.sim_iq_file_path.clone(),
+             udp_addr: self.sim_udp_addr.clone(),
+             tcp_port: self.sim_tcp_port,
+@@ -193,6 +194,7 @@ impl MyApp {
+                 }
+             }),
+             output_type: self.sim_output_type.clone(),
++            pluto: self.sim_pluto.clone(),
+             iq_file_path: self.sim_iq_file_path.clone(),
+             udp_addr: self.sim_udp_addr.clone(),
+             tcp_port: self.sim_tcp_port,
+@@ -281,6 +283,7 @@ impl MyApp {
+                 }
+             }),
+             output_type: self.sim_output_type.clone(),
++            pluto: self.sim_pluto.clone(),
+             iq_file_path: self.sim_iq_file_path.clone(),
+             udp_addr: self.sim_udp_addr.clone(),
+             tcp_port: self.sim_tcp_port,
+diff --git a/src/gps_sim/error.rs b/src/gps_sim/error.rs
+index 1d1d811..6043192 100644
+--- a/src/gps_sim/error.rs
++++ b/src/gps_sim/error.rs
+@@ -24,6 +24,10 @@ pub enum SimError {
+     #[error("HackRF error: {0}")]
+     HackRf(#[from] super::hackrf::HackrfError),
+ 
++    /// Pluto helper, dependency, or device error.
++    #[error("PlutoSDR error: {0}")]
++    Pluto(String),
++
+     /// Simulation was stopped externally via the stop handle.
+     #[error("Simulation aborted by stop signal")]
+     Aborted,
+diff --git a/src/gps_sim/mod.rs b/src/gps_sim/mod.rs
+index 069ab99..cd34988 100644
+--- a/src/gps_sim/mod.rs
++++ b/src/gps_sim/mod.rs
+@@ -48,11 +48,13 @@ pub mod types;
+ 
+ // Internal modules — not part of the public API.
+ mod channel;
++mod pluto;
+ mod sim;
+ 
+ // ── Re-exports ────────────────────────────────────────────────────────────────
+ 
+ pub use error::SimError;
++pub use pluto::PlutoConfig;
+ pub use rinex::NavData;
+ pub use sim::{
+     InteractiveState, SatInfo, SimEvent, SimProgress, Simulator, SimulatorBuilder, SimulatorHandle,
+@@ -77,15 +79,15 @@ pub enum SdrOutput {
+     /// Discard all generated samples (useful for benchmarking and testing).
+     Null,
+ 
+-    /// Stream to an ADALM-PLUTO SDR via its IIO network daemon (iiod, port 30431).
+-    ///
+-    /// The `PlutoSDR` must be connected via USB (RNDIS/CDC-ECM network adapter,
+-    /// default IP 192.168.2.1) or reachable over the network.  Samples are
+-    /// converted from signed 8-bit to 16-bit before transmission.
+-    ///
+-    /// Requires the `plutosdr` Cargo feature: `cargo build --features plutosdr`.
++    /// Compatibility shorthand for [`Self::Pluto`]. A bare host is prefixed
++    /// with `ip:`; a full libiio URI is accepted unchanged. Uses the default
++    /// Python interpreter, with TX gain in dB (-89 through 0).
+     PlutoSdr { host: String, gain_db: i32 },
+ 
++    /// Transmit through `pyadi-iio` / libiio using explicit device settings.
++    /// Python dependencies are needed only when this output is selected.
++    Pluto { config: PlutoConfig },
++
+     /// Stream raw signed 8-bit IQ samples as UDP datagrams.
+     ///
+     /// Each datagram carries `32 768` interleaved I/Q bytes (16 384 complex
+@@ -110,7 +112,9 @@ impl SdrOutput {
+     pub fn max_sample_rate(&self) -> Option<f64> {
+         match self {
+             Self::HackRf { .. } => Some(types::consts::HACKRF_MAX_SAMPLE_RATE),
+-            Self::PlutoSdr { .. } => Some(types::consts::PLUTO_MAX_SAMPLE_RATE),
++            Self::PlutoSdr { .. } | Self::Pluto { .. } => {
++                Some(types::consts::PLUTO_MAX_SAMPLE_RATE)
++            }
+             Self::IqFile { .. } | Self::Null | Self::UdpStream { .. } | Self::TcpServer { .. } => {
+                 None
+             }
+diff --git a/src/gps_sim/sim.rs b/src/gps_sim/sim.rs
+index 8bf5d36..d38774d 100644
+--- a/src/gps_sim/sim.rs
++++ b/src/gps_sim/sim.rs
+@@ -432,19 +432,20 @@ impl SimulatorBuilder {
+         self
+     }
+ 
+-    /// Override the `HackRF` sample rate (Hz).  Defaults to 3 MSPS.
++    /// Override the IQ sample rate (Hz) for all outputs, including Pluto.
++    /// The historical method name is retained for compatibility.
+     pub fn hackrf_sample_rate(mut self, hz: f64) -> Self {
+         self.hackrf_sample_rate = Some(hz);
+         self
+     }
+ 
+-    /// Override the `HackRF` centre frequency (Hz).  Defaults to GPS L1 C/A.
++    /// Override the SDR centre frequency (Hz), including Pluto. Defaults to GPS L1 C/A.
+     pub fn hackrf_center_freq(mut self, hz: u64) -> Self {
+         self.hackrf_center_freq = Some(hz);
+         self
+     }
+ 
+-    /// Override the `HackRF` baseband filter bandwidth (Hz).
++    /// Override the SDR baseband filter bandwidth (Hz), including Pluto.
+     ///
+     /// When not set, `set_sample_rate_auto` chooses the filter automatically.
+     pub fn hackrf_baseband_filter(mut self, hz: u32) -> Self {
+@@ -856,6 +857,10 @@ impl Simulator {
+         // Extract the output variant *before* matching so that `self` is not
+         // partially moved — replace with a cheap sentinel so the rest of `self`
+         // can still be passed by value to the dispatch methods.
++        let pluto_sample_rate = match &self.output {
++            SdrOutput::PlutoSdr { .. } | SdrOutput::Pluto { .. } => self.effective_sample_rate(),
++            _ => 0.0,
++        };
+         let output = std::mem::replace(&mut self.output, SdrOutput::Null);
+ 
+         match output {
+@@ -865,8 +870,30 @@ impl Simulator {
+             SdrOutput::IqFile { path } => self.run_file(g0, rx_ecef, ieph, &path, istate, log_file),
+             SdrOutput::Null => self.run_null(g0, rx_ecef, ieph, istate, log_file),
+             SdrOutput::PlutoSdr { host, gain_db } => {
+-                self.run_plutosdr(g0, rx_ecef, ieph, host, gain_db, istate, log_file)
++                let config = super::PlutoConfig {
++                    uri: host,
++                    gain_db: f64::from(gain_db),
++                    ..super::PlutoConfig::default()
++                };
++                self.run_plutosdr(
++                    g0,
++                    rx_ecef,
++                    ieph,
++                    &config,
++                    pluto_sample_rate,
++                    istate,
++                    log_file,
++                )
+             }
++            SdrOutput::Pluto { config } => self.run_plutosdr(
++                g0,
++                rx_ecef,
++                ieph,
++                &config,
++                pluto_sample_rate,
++                istate,
++                log_file,
++            ),
+             SdrOutput::UdpStream { addr } => {
+                 self.run_udp(g0, rx_ecef, ieph, &addr, istate, log_file)
+             }
+@@ -1147,26 +1174,89 @@ impl Simulator {
+ 
+     #[expect(
+         clippy::too_many_arguments,
+-        reason = "signature must mirror caller dispatch; all parameters required"
+-    )]
+-    #[expect(
+-        clippy::unused_self,
+-        reason = "stub for unbuilt PlutoSDR feature; self would be used in a full impl"
++        reason = "signature mirrors the existing backend dispatch"
+     )]
+     fn run_plutosdr(
+         self,
+         g0: GpsTime,
+         rx_ecef: [f64; 3],
+         ieph: usize,
+-        host: String,
+-        gain_db: i32,
++        config: &super::PlutoConfig,
++        sample_rate: f64,
+         istate: Option<Arc<Mutex<InteractiveState>>>,
+         log_file: Option<BufWriter<std::fs::File>>,
+     ) -> Result<(), SimError> {
+-        let _unused = (g0, rx_ecef, ieph, host, gain_db, istate, log_file);
+-        Err(SimError::Config(
+-            "PlutoSDR support is not available in this build.".into(),
+-        ))
++        let frequency = self.hackrf_center_freq.unwrap_or(1_575_420_000);
++        let bandwidth = self.hackrf_baseband_filter.unwrap_or(sample_rate as u32);
++        let mut tx =
++            super::pluto::PlutoTx::open(config, sample_rate, frequency, bandwidth, &self.stop)?;
++        let emit: Arc<dyn Fn(SimEvent) + Send + Sync> = if let Some(f) = self.on_event {
++            Arc::new(f)
++        } else {
++            Arc::new(|_| {})
++        };
++        let emit2 = emit.clone();
++
++        // libiio push acknowledgements supply hardware back-pressure.
++        let fifo = IqFifo::new(4);
++        let consumer = fifo.consumer;
++        let producer = fifo.producer;
++        let stop = self.stop.clone();
++        let pause = self.pause.clone();
++        let nav = self.nav.clone();
++
++        let waypoints = self.waypoints;
++        let blocked_prns = self.blocked_prns;
++        let duration = self.duration;
++        let elev_mask = self.elev_mask;
++        let fixed_gain = self.fixed_gain;
++        let use_beidou = self.use_beidou;
++        let use_galileo = self.use_galileo;
++        let gps_thread = std::thread::Builder::new()
++            .name("gps-gen".into())
++            .spawn(move || {
++                generate_iq(
++                    g0,
++                    rx_ecef,
++                    &waypoints,
++                    istate.as_ref(),
++                    &blocked_prns,
++                    &nav,
++                    ieph,
++                    duration,
++                    elev_mask,
++                    &stop,
++                    pause.as_deref(),
++                    &producer,
++                    &*emit2,
++                    log_file,
++                    fixed_gain,
++                    use_beidou,
++                    use_galileo,
++                    sample_rate,
++                    false,
++                );
++                producer.shutdown();
++            })?;
++
++        let mut result = Ok(());
++        while let Some(buf) = consumer.dequeue() {
++            if result.is_ok() {
++                result = tx.write(&buf, &self.stop);
++                if result.is_err() {
++                    self.stop.store(true, Ordering::Relaxed);
++                }
++            }
++            // Always return/drain buffers after failure: the generator may be
++            // blocked in acquire() and must wake before it observes stop.
++            consumer.release(buf);
++        }
++        let generated = gps_thread.join().map_err(|_| SimError::Aborted);
++        result?;
++        generated?;
++        tx.finish(&self.stop)?;
++        emit(SimEvent::Done);
++        Ok(())
+     }
+ 
+     // ── UDP streaming backend ─────────────────────────────────────────────────
+diff --git a/src/simulator/state.rs b/src/simulator/state.rs
+index 186c7fa..47b93cc 100644
+--- a/src/simulator/state.rs
++++ b/src/simulator/state.rs
+@@ -6,6 +6,8 @@ pub enum SimOutputType {
+     /// Transmit via `HackRF` One (USB).
+     #[default]
+     HackRf,
++    /// Transmit through ADALM-Pluto using pyadi-iio / libiio.
++    Pluto,
+     /// Write raw 8-bit IQ samples to a file.
+     IqFile,
+     /// Stream IQ samples over UDP.
+@@ -32,6 +34,8 @@ pub struct SimSatInfo {
+ pub struct SimSettings {
+     /// Output sink selector.
+     pub output_type: SimOutputType,
++    /// ADALM-Pluto runtime configuration; used only by the Pluto output.
++    pub pluto: crate::gps_sim::PlutoConfig,
+     /// When `true`, `BeiDou` B1C signals are included in the simulation.
+     /// Defaults to `false` (GPS only).
+     pub use_beidou: bool,
+diff --git a/src/simulator/worker.rs b/src/simulator/worker.rs
+index 0ec1bc1..f0fc650 100644
+--- a/src/simulator/worker.rs
++++ b/src/simulator/worker.rs
+@@ -342,6 +342,9 @@ fn build_output(settings: &SimSettings) -> crate::gps_sim::SdrOutput {
+             gain_db: i32::from(settings.txvga_gain),
+             amp: settings.amp_enable,
+         },
++        SimOutputType::Pluto => SdrOutput::Pluto {
++            config: settings.pluto.clone(),
++        },
+         SimOutputType::IqFile => SdrOutput::IqFile {
+             path: settings.iq_file_path.clone(),
+         },
+diff --git a/src/ui/sim/settings.rs b/src/ui/sim/settings.rs
+index 9489ed8..2c374db 100644
+--- a/src/ui/sim/settings.rs
++++ b/src/ui/sim/settings.rs
+@@ -11,11 +11,13 @@ use crate::ui::widgets::section_title;
+ )]
+ pub(crate) fn show_sim_settings_tab(app: &mut MyApp, ui: &mut egui::Ui) {
+     // Settings are locked while either simulator is running.
+-    let either_running = app.sim_thread.is_some() || app.sim_static_thread.is_some();
++    let either_running = app.sim_thread.is_some()
++        || app.sim_static_thread.is_some()
++        || app.sim_interactive_thread.is_some();
+ 
+     ui.add_space(4.0);
+     ui.label(
+-        egui::RichText::new("Shared by Dynamic Mode and Static Mode.")
++        egui::RichText::new("Shared by Dynamic, Static and Interactive modes.")
+             .weak()
+             .italics(),
+     );
+@@ -181,13 +183,18 @@ pub(crate) fn show_sim_settings_tab(app: &mut MyApp, ui: &mut egui::Ui) {
+         ui.group(|ui| {
+             section_title(ui, "Output Sink");
+ 
+-            ui.horizontal(|ui| {
++            ui.horizontal_wrapped(|ui| {
+                 ui.selectable_value(
+                     &mut app.sim_output_type,
+                     crate::simulator::SimOutputType::HackRf,
+                     "HackRF",
+                 )
+                 .on_hover_text("Transmit via HackRF One USB device.");
++                ui.selectable_value(
++                    &mut app.sim_output_type,
++                    crate::simulator::SimOutputType::Pluto,
++                    "ADALM-Pluto",
++                );
+                 ui.selectable_value(
+                     &mut app.sim_output_type,
+                     crate::simulator::SimOutputType::IqFile,
+@@ -215,6 +222,28 @@ pub(crate) fn show_sim_settings_tab(app: &mut MyApp, ui: &mut egui::Ui) {
+             });
+ 
+             match app.sim_output_type {
++                crate::simulator::SimOutputType::Pluto => {
++                    ui.horizontal(|ui| {
++                        ui.label("Device URI:");
++                        ui.text_edit_singleline(&mut app.sim_pluto.uri)
++                            .on_hover_text("libiio URI, e.g. ip:192.168.2.1 or usb:1.2.5");
++                    });
++                    ui.horizontal(|ui| {
++                        ui.label("Python executable:");
++                        ui.text_edit_singleline(&mut app.sim_pluto.python)
++                            .on_hover_text("Executable path only; use the Python where pyadi-iio is installed.");
++                    });
++                    ui.horizontal(|ui| {
++                        ui.label("Pluto TX gain:");
++                        ui.add(egui::Slider::new(&mut app.sim_pluto.gain_db, -89.0..=0.0).suffix(" dB"));
++                    });
++                    ui.horizontal(|ui| {
++                        ui.label("I/O timeout:");
++                        ui.add(egui::DragValue::new(&mut app.sim_pluto.timeout_ms)
++                            .range(100..=60_000).suffix(" ms"));
++                    });
++                    ui.label("Requires Python, numpy, pyadi-iio and native libiio. See docs/PLUTO.md.");
++                }
+                 crate::simulator::SimOutputType::IqFile => {
+                     ui.horizontal(|ui| {
+                         ui.label("File path:");
+@@ -246,22 +275,25 @@ pub(crate) fn show_sim_settings_tab(app: &mut MyApp, ui: &mut egui::Ui) {
+     // ── HackRF settings ───────────────────────────────────────────────────────
+     ui.add_enabled_ui(!either_running, |ui| {
+         ui.group(|ui| {
+-            section_title(ui, "HackRF Settings");
++            section_title(ui, "RF Settings (HackRF / Pluto)");
+ 
+             ui.horizontal(|ui| {
+                 ui.label("TX VGA Gain:").on_hover_text(
+                     "Transmit Variable Gain Amplifier level (0–47 dB). \
+                          Higher values increase the transmitted signal power.",
+                 );
+-                ui.add(egui::Slider::new(&mut app.sim_txvga_gain, 0..=47).suffix(" dB"))
+-                    .on_hover_text(
+-                        "HackRF TX VGA gain in dB (0–47). \
++                ui.add_enabled(
++                    app.sim_output_type == crate::simulator::SimOutputType::HackRf,
++                    egui::Slider::new(&mut app.sim_txvga_gain, 0..=47).suffix(" dB"),
++                )
++                .on_hover_text(
++                    "HackRF TX VGA gain in dB (0–47). \
+                          Increase carefully; strong signals can interfere with nearby receivers.",
+-                    );
++                );
+             });
+             ui.horizontal(|ui| {
+                 ui.label("Sample Rate:").on_hover_text(
+-                    "Baseband IQ sample rate sent to the HackRF. \
++                    "Baseband IQ sample rate sent to the selected SDR. \
+                          Must be at least 2.046 MHz for GPS L1 C/A.",
+                 );
+                 ui.add(
+@@ -280,7 +312,7 @@ pub(crate) fn show_sim_settings_tab(app: &mut MyApp, ui: &mut egui::Ui) {
+                         .suffix(" Hz"),
+                 )
+                 .on_hover_text(
+-                    "RF centre frequency transmitted by the HackRF. \
++                    "RF centre frequency transmitted by the selected SDR. \
+                      Default: 1 575 420 000 Hz (GPS L1 C/A).",
+                 );
+                 if ui
+@@ -295,7 +327,7 @@ pub(crate) fn show_sim_settings_tab(app: &mut MyApp, ui: &mut egui::Ui) {
+                 ui.checkbox(&mut app.sim_baseband_filter_enable, "Baseband filter:")
+                     .on_hover_text(
+                         "Override the baseband filter bandwidth. \
+-                         When unchecked, set_sample_rate_auto sets this automatically.",
++                         When unchecked, HackRF selects automatically; Pluto uses the sample rate.",
+                     );
+                 ui.add_enabled(
+                     app.sim_baseband_filter_enable,
+@@ -305,11 +337,14 @@ pub(crate) fn show_sim_settings_tab(app: &mut MyApp, ui: &mut egui::Ui) {
+                         .suffix(" Hz"),
+                 );
+             });
+-            ui.checkbox(&mut app.sim_amp_enable, "Enable RF Amplifier")
+-                .on_hover_text(
+-                    "Enable the HackRF on-board RF amplifier (+11 dB). \
++            ui.add_enabled(
++                app.sim_output_type == crate::simulator::SimOutputType::HackRf,
++                egui::Checkbox::new(&mut app.sim_amp_enable, "Enable HackRF RF Amplifier"),
++            )
++            .on_hover_text(
++                "Enable the HackRF on-board RF amplifier (+11 dB). \
+                      Use only when the antenna is connected and in a shielded enclosure.",
+-                );
++            );
+             ui.label(
+                 egui::RichText::new(
+                     "⚠ Transmitting GPS signals may be illegal. \
+diff --git a/.github/workflows/pluto.yml b/.github/workflows/pluto.yml
+new file mode 100644
+--- /dev/null
++++ b/.github/workflows/pluto.yml
+@@ -0,0 +1,15 @@
++name: Pluto hardware-free tests
++on: [push, pull_request, workflow_dispatch]
++jobs:
++  helper:
++    runs-on: ${{ matrix.os }}
++    strategy:
++      matrix:
++        os: [ubuntu-latest, windows-latest, macos-latest]
++    steps:
++      - uses: actions/checkout@v4
++      - uses: actions/setup-python@v5
++        with:
++          python-version: '3.12'
++      - run: python -m pip install "numpy>=1.24,<3"
++      - run: python -m unittest discover -s tests -p test_pluto_bridge.py -v
+diff --git a/docs/PLUTO.md b/docs/PLUTO.md
+new file mode 100644
+--- /dev/null
++++ b/docs/PLUTO.md
+@@ -0,0 +1,132 @@
++# ADALM-Pluto output
++
++Select **GPS Simulator → Settings → Output Sink → ADALM-Pluto**. The output
++works with Dynamic, Static and Interactive modes. HackRF remains the default;
++IQ File, UDP, TCP and Null keep their existing implementations.
++
++Use GNSS simulation only in an authorised, contained test setup. Follow the
++project's shielded-enclosure/direct-cable guidance. No hardware was used to
++validate this implementation; uninterrupted RF output and receiver acquisition
++still need a bench test.
++
++## Dependencies and build
++
++The application remains Rust-only to build: there are **no new Cargo dependencies,
++native link requirements or Cargo feature flags**. Pluto is an optional runtime
++dependency. Its Python helper is embedded in the executable, so there is no
++separate script to copy next to a release binary.
++
++Install Python 3.10 or newer, NumPy, Analog Devices' `pyadi-iio` and the native
++libiio library. `pyadi-iio` installs the Python `pylibiio` bindings, but pip does
++not install the native libiio DLL/shared library. Do not install the unrelated
++PyPI package named `iio`.
++
++```sh
++python -m venv .venv-pluto
++# Windows:
++.venv-pluto\Scripts\python.exe -m pip install -r requirements-pluto.txt
++# Linux/macOS:
++.venv-pluto/bin/python -m pip install -r requirements-pluto.txt
++```
++
++On Windows, use an Analog Devices libiio release matching your Python
++architecture and make its DLL directory available to that Python installation.
++On Linux, install your distribution's libiio runtime/utilities, or build the ADI
++release. On macOS, install libiio with your package manager or build it. Use a
++compatible native library and Python bindings; mixing libiio major versions can
++fail during import. A conda environment containing `pyadi-iio` is another option.
++
++Check dependencies using the **same Python executable** you enter in the GUI:
++
++```sh
++python -c "import numpy, iio, adi; print(adi.__version__)"
++```
++
++See the official [ADI installation guide](https://analogdevicesinc.github.io/pyadi-iio/guides/quick.html),
++[libiio releases](https://github.com/analogdevicesinc/libiio/releases), and
++[buffer documentation](https://analogdevicesinc.github.io/pyadi-iio/buffers/index.html).
++
++## Settings
++
++| Setting | Meaning |
++| --- | --- |
++| Device URI | Explicit libiio device selection, default `ip:192.168.2.1`. A full URI such as `usb:1.2.5` is also accepted; use `iio_info -s` to find available contexts. Bare hostnames/IP addresses are prefixed with `ip:` for compatibility. |
++| Python executable | Executable name or full path into a virtual environment. No extra arguments or shell quoting. Defaults to `python` on Windows and `python3` elsewhere. |
++| Pluto TX gain | Hardware gain from -89 to 0 dB, default -80 dB. Negative values mean attenuation. This is separate from HackRF VGA gain and RF amp, which do not apply to Pluto. |
++| I/O timeout | 100–60000 ms, default 10000. Applies to libiio operations and the supervised helper. Startup allows an additional 20 seconds for imports and device configuration. Stop remains responsive while waiting for the helper. |
++| Sample rate | Shared RF setting, 1–20 MSPS. The same integer rate drives IQ generation and Pluto. Readback mismatch is an error. The upper bound is a configuration limit, not a throughput guarantee. |
++| Centre frequency | Shared RF setting. Pluto validates the stock AD9363 range (325–3800 MHz); firmware range extensions are not assumed. |
++| Baseband filter | Shared RF setting. If disabled, Pluto uses the sample rate as TX bandwidth; an explicit override must be 200 kHz–20 MHz. |
++
++Settings are locked while any simulation mode is running. Like the existing
++output selector, Pluto settings are session-only. The existing 3 MSPS GPS default
++is a reasonable starting point. Constellation/sample-rate requirements and the
++existing engine's modelling limits still apply; selecting Pluto does not add
++new GNSS models or resampling.
++
++## Public Rust API
++
++Use `SdrOutput::Pluto { config: PlutoConfig { ... } }` with
++`Simulator::builder().output(...)`. Both types are exported by `gps_sim`.
++`PlutoConfig::default()` supplies the GUI defaults. Set `uri`, `python`,
++`gain_db` and `timeout_ms` as needed. The existing
++`SdrOutput::PlutoSdr { host, gain_db }` variant now works as a compatibility
++shorthand with the default Python executable and timeout. Gain is negative dB,
++not HackRF's positive VGA setting.
++
++The historical builder methods `hackrf_sample_rate`, `hackrf_center_freq` and
++`hackrf_baseband_filter` also configure Pluto. Their names are retained so
++existing callers continue to compile. Without a rate override, Pluto uses the
++engine's constellation-based selection capped at the existing Pluto limit.
++
++## Implementation and errors
++
++The existing sc8 generator and FIFO are unchanged. Rust launches an embedded
++Python helper with an argument list (no shell) and sends fixed 262144-byte
++interleaved IQ blocks through stdin. The helper converts signed sc8 components
++to unnormalised complex values scaled by 256 for pyadi-iio's signed int16 TX
++input. It uses channel 0 and **non-cyclic** buffers: every push contains fresh
++samples, so dynamic routes do not replay a stale waveform.
++
++The helper acknowledges startup and each successful `tx()` call. Hardware
++back-pressure paces generation; no additional clock gate is added. Only one
++block is in flight through the supervisor, and the existing FIFO bounds queued
++generation. At natural EOF the helper allows four buffer durations to drain
++before destroying its TX buffer. Final IQ data includes the engine's existing
++zero-padded last block. Static loop passes reopen the backend, as existing
++hardware outputs do; seamless RF across pass boundaries is not guaranteed.
++
++Rust captures a bounded stderr tail for GUI errors, supervises stalled writes,
++and kills/reaps the helper on cancellation or timeout. The generator's FIFO is
++drained on TX failure so a blocked producer can stop. Python errors clean up
++the TX buffer in `finally`; forced termination relies on libiio/process resource
++cleanup. Missing Python/packages/DLLs, invalid settings, device-open errors and
++transfer failures do not silently fall back to another output.
++
++If imports fail, check the selected Python and native libiio installation. If
++opening the device fails, verify the URI and USB/network driver. If transfer
++timeouts occur, check host/USB performance and configured rate. No automatic
++USB discovery or driver installation is performed by the application.
++
++## Hardware-free checks
++
++```sh
++python -m pip install numpy
++python -m unittest discover -s tests -p test_pluto_bridge.py -v
++cargo fmt --all -- --check
++cargo check --workspace --all-targets --locked
++cargo clippy --workspace --all-targets --all-features -- -D warnings -W clippy::all
++cargo test --workspace --all-targets --all-features
++cargo test --workspace --doc
++```
++
++Python tests use a fake radio to verify all signed sample values, I/Q order,
++partial pipe reads, multiple fresh buffers, radio settings, non-cyclic mode,
++dependency errors, sample-rate mismatch and cleanup after transfer failure.
++They never open a real Pluto. Rust unit tests check configuration and URI
++normalisation. The Python helper tests also run in CI on Windows, Linux and macOS.
++
++Before relying on this backend, validate on physical hardware in the contained
++test setup: connection for each supported URI type, measured RF rate/frequency,
++amplitude, sustained transfer, natural completion, Stop, disconnects and static
++loop transitions. Software tests do not prove RF continuity or a receiver fix.
+diff --git a/requirements-pluto.txt b/requirements-pluto.txt
+new file mode 100644
+--- /dev/null
++++ b/requirements-pluto.txt
+@@ -0,0 +1,3 @@
++# Optional runtime dependencies; native libiio must be installed separately.
++numpy>=1.24,<3
++pyadi-iio==0.0.21
+diff --git a/src/gps_sim/pluto.rs b/src/gps_sim/pluto.rs
+new file mode 100644
+--- /dev/null
++++ b/src/gps_sim/pluto.rs
+@@ -0,0 +1,334 @@
++//! Supervised, bounded sc8 pipe to the embedded `pyadi-iio` transmitter.
++
++use std::io::{BufRead as _, BufReader, Read as _, Write as _};
++use std::process::{Child, Command, Stdio};
++use std::sync::{
++    Arc, Mutex,
++    atomic::{AtomicBool, Ordering},
++    mpsc::{self, Receiver, RecvTimeoutError, Sender},
++};
++use std::thread::JoinHandle;
++use std::time::{Duration, Instant};
++
++use super::SimError;
++
++const HELPER: &str = include_str!("pluto_bridge.py");
++const STDERR_LIMIT: usize = 8192;
++
++/// Runtime settings for the optional ADALM-Pluto output backend.
++#[derive(Debug, Clone)]
++pub struct PlutoConfig {
++    /// libiio URI, e.g. `ip:192.168.2.1` or `usb:1.2.5`.
++    pub uri: String,
++    /// Python executable path only (no arguments); may point into a virtualenv.
++    pub python: String,
++    /// TX hardware gain in dB, -89 through 0 (negative means attenuation).
++    pub gain_db: f64,
++    /// Per-operation timeout; also bounds stalled pipe writes and shutdown.
++    pub timeout_ms: u32,
++}
++
++impl Default for PlutoConfig {
++    fn default() -> Self {
++        Self {
++            uri: "ip:192.168.2.1".into(),
++            python: if cfg!(windows) { "python" } else { "python3" }.into(),
++            gain_db: -80.0,
++            timeout_ms: 10_000,
++        }
++    }
++}
++
++impl PlutoConfig {
++    pub(super) fn validate(
++        &self,
++        rate: f64,
++        frequency: u64,
++        bandwidth: u32,
++    ) -> Result<(), SimError> {
++        let message = if self.uri.trim().is_empty() || self.python.trim().is_empty() {
++            Some("Pluto URI and Python executable must not be empty")
++        } else if !self.gain_db.is_finite() || !(-89.0..=0.0).contains(&self.gain_db) {
++            Some("Pluto TX gain must be between -89 and 0 dB")
++        } else if !rate.is_finite()
++            || !(1_000_000.0..=20_000_000.0).contains(&rate)
++            || rate.fract() != 0.0
++        {
++            Some("Pluto sample rate must be a whole number between 1 and 20 MSPS")
++        } else if !(325_000_000..=3_800_000_000).contains(&frequency) {
++            Some("Pluto centre frequency must be within the stock AD9363 range (325–3800 MHz)")
++        } else if !(200_000..=20_000_000).contains(&bandwidth) {
++            Some("Pluto TX bandwidth must be between 200 kHz and 20 MHz")
++        } else if !(100..=60_000).contains(&self.timeout_ms) {
++            Some("Pluto timeout must be between 100 and 60000 milliseconds")
++        } else {
++            None
++        };
++        match message {
++            Some(message) => Err(SimError::Config(message.into())),
++            None => Ok(()),
++        }
++    }
++}
++
++pub(super) fn normalize_uri(uri: &str) -> String {
++    let uri = uri.trim();
++    if uri.contains(':') {
++        uri.into()
++    } else {
++        format!("ip:{uri}")
++    }
++}
++
++/// Owns and reaps the helper even on cancellation, timeout, or unwinding.
++pub(super) struct PlutoTx {
++    child: Child,
++    commands: Sender<Option<Vec<u8>>>,
++    replies: Receiver<Result<(), String>>,
++    stderr: Arc<Mutex<Vec<u8>>>,
++    threads: Vec<JoinHandle<()>>,
++    timeout: Duration,
++}
++
++impl PlutoTx {
++    pub(super) fn open(
++        config: &PlutoConfig,
++        rate: f64,
++        frequency: u64,
++        bandwidth: u32,
++        stop: &AtomicBool,
++    ) -> Result<Self, SimError> {
++        config.validate(rate, frequency, bandwidth)?;
++        if stop.load(Ordering::Relaxed) {
++            return Err(SimError::Aborted);
++        }
++        let mut command = Command::new(&config.python);
++        command.args([
++            "-u",
++            "-c",
++            HELPER,
++            "--uri",
++            &normalize_uri(&config.uri),
++            "--rate",
++            &format!("{rate:.0}"),
++            "--frequency",
++            &frequency.to_string(),
++            "--bandwidth",
++            &bandwidth.to_string(),
++            "--gain",
++            &config.gain_db.to_string(),
++            "--timeout-ms",
++            &config.timeout_ms.to_string(),
++        ]);
++        let mut tx = Self::spawn(command, Duration::from_millis(u64::from(config.timeout_ms)))?;
++        // Importing scientific Python and configuring the FIR may take longer
++        // than one transfer. This deadline still covers a hung device open.
++        tx.wait_reply(stop, tx.timeout + Duration::from_secs(20))?;
++        Ok(tx)
++    }
++
++    fn spawn(mut command: Command, timeout: Duration) -> Result<Self, SimError> {
++        command
++            .stdin(Stdio::piped())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped());
++        #[cfg(windows)]
++        {
++            use std::os::windows::process::CommandExt as _;
++            command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
++        }
++        let mut child = command.spawn().map_err(|error| {
++            SimError::Pluto(format!("Cannot launch Python: {error}. Set the Pluto Python executable and install pyadi-iio, numpy and libiio."))
++        })?;
++        // Stdio::piped guarantees these handles after a successful spawn.
++        let mut input = child.stdin.take().expect("piped stdin");
++        let mut output = BufReader::new(child.stdout.take().expect("piped stdout"));
++        let mut errors = child.stderr.take().expect("piped stderr");
++        let stderr = Arc::new(Mutex::new(Vec::new()));
++        let captured = Arc::clone(&stderr);
++        let error_thread = std::thread::spawn(move || {
++            let mut block = [0_u8; 1024];
++            while let Ok(count) = errors.read(&mut block) {
++                if count == 0 {
++                    break;
++                }
++                let mut tail = captured.lock().unwrap_or_else(|error| error.into_inner());
++                tail.extend(block.iter().take(count));
++                let excess = tail.len().saturating_sub(STDERR_LIMIT);
++                tail.drain(..excess);
++            }
++        });
++        let (commands, incoming) = mpsc::channel::<Option<Vec<u8>>>();
++        let (reply, replies) = mpsc::channel();
++        let io_thread = std::thread::spawn(move || {
++            let result = expect_reply(&mut output, "READY");
++            let failed = result.is_err();
++            if reply.send(result).is_err() || failed {
++                return;
++            }
++            while let Ok(message) = incoming.recv() {
++                let Some(bytes) = message else {
++                    drop(input); // EOF: drain and destroy TX buffer, then DONE.
++                    let _sent = reply.send(expect_reply(&mut output, "DONE"));
++                    return;
++                };
++                let result = input
++                    .write_all(&bytes)
++                    .map_err(|error| error.to_string())
++                    .and_then(|()| expect_reply(&mut output, "OK"));
++                let failed = result.is_err();
++                if reply.send(result).is_err() || failed {
++                    return;
++                }
++            }
++        });
++        Ok(Self {
++            child,
++            commands,
++            replies,
++            stderr,
++            threads: vec![error_thread, io_thread],
++            timeout,
++        })
++    }
++
++    fn wait_reply(&mut self, stop: &AtomicBool, timeout: Duration) -> Result<(), SimError> {
++        let started = Instant::now();
++        loop {
++            if stop.load(Ordering::Relaxed) {
++                return Err(SimError::Aborted);
++            }
++            if started.elapsed() >= timeout {
++                return Err(self.failure("Pluto helper timed out"));
++            }
++            match self.replies.recv_timeout(Duration::from_millis(25)) {
++                Ok(Ok(())) => return Ok(()),
++                Ok(Err(message)) => return Err(self.failure(&message)),
++                Err(RecvTimeoutError::Disconnected) => {
++                    return Err(self.failure("Pluto helper exited"));
++                }
++                Err(RecvTimeoutError::Timeout) => {}
++            }
++        }
++    }
++
++    fn failure(&mut self, message: &str) -> SimError {
++        self.terminate();
++        let tail = self
++            .stderr
++            .lock()
++            .unwrap_or_else(|error| error.into_inner());
++        SimError::Pluto(format!("{message}: {}", String::from_utf8_lossy(&tail)))
++    }
++
++    pub(super) fn write(&mut self, samples: &[i8], stop: &AtomicBool) -> Result<(), SimError> {
++        let bytes = samples.iter().map(|&sample| sample as u8).collect();
++        self.commands
++            .send(Some(bytes))
++            .map_err(|error| SimError::Pluto(error.to_string()))?;
++        self.wait_reply(stop, self.timeout)
++    }
++
++    pub(super) fn finish(&mut self, stop: &AtomicBool) -> Result<(), SimError> {
++        self.commands
++            .send(None)
++            .map_err(|error| SimError::Pluto(error.to_string()))?;
++        self.wait_reply(stop, self.timeout)?;
++        let started = Instant::now();
++        loop {
++            if stop.load(Ordering::Relaxed) {
++                return Err(SimError::Aborted);
++            }
++            if let Some(status) = self.child.try_wait()? {
++                return if status.success() {
++                    Ok(())
++                } else {
++                    Err(self.failure("Pluto helper failed"))
++                };
++            }
++            if started.elapsed() >= self.timeout {
++                return Err(self.failure("Pluto helper did not exit"));
++            }
++            std::thread::sleep(Duration::from_millis(25));
++        }
++    }
++
++    fn terminate(&mut self) {
++        let _killed = self.child.kill();
++        let _reaped = self.child.wait();
++        // Wake an idle I/O thread even when no samples were ever sent.
++        let _sent = self.commands.send(None);
++        for thread in self.threads.drain(..) {
++            let _joined = thread.join();
++        }
++    }
++}
++
++impl Drop for PlutoTx {
++    fn drop(&mut self) {
++        self.terminate();
++    }
++}
++
++fn expect_reply(reader: &mut impl std::io::BufRead, expected: &str) -> Result<(), String> {
++    // A malformed helper must not make us allocate without limit.
++    let mut line = String::new();
++    reader
++        .take(256)
++        .read_line(&mut line)
++        .map_err(|error| error.to_string())?;
++    if line.trim() == expected {
++        Ok(())
++    } else {
++        Err(format!("Expected Pluto {expected}, received {line:?}"))
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::{PlutoConfig, normalize_uri};
++
++    #[test]
++    fn accepts_defaults_and_preserves_iio_uris() {
++        assert!(
++            PlutoConfig::default()
++                .validate(3_000_000.0, 1_575_420_000, 3_000_000)
++                .is_ok()
++        );
++        assert_eq!(normalize_uri(" 192.168.2.1 "), "ip:192.168.2.1");
++        assert_eq!(normalize_uri("usb:1.2.5"), "usb:1.2.5");
++        assert_eq!(normalize_uri("ip:pluto.local"), "ip:pluto.local");
++    }
++
++    #[test]
++    fn rejects_invalid_rf_and_runtime_settings() {
++        let mut config = PlutoConfig::default();
++        for gain in [1.0, -90.0, f64::NAN] {
++            config.gain_db = gain;
++            assert!(
++                config
++                    .validate(3_000_000.0, 1_575_420_000, 3_000_000)
++                    .is_err()
++            );
++        }
++        config.gain_db = -80.0;
++        for rate in [0.0, f64::NAN, 999_999.0, 20_000_001.0, 3_000_000.5] {
++            assert!(config.validate(rate, 1_575_420_000, 3_000_000).is_err());
++        }
++        assert!(config.validate(3_000_000.0, 1, 3_000_000).is_err());
++        assert!(config.validate(3_000_000.0, 1_575_420_000, 1).is_err());
++        config.timeout_ms = 0;
++        assert!(
++            config
++                .validate(3_000_000.0, 1_575_420_000, 3_000_000)
++                .is_err()
++        );
++        config.timeout_ms = 10_000;
++        config.uri.clear();
++        assert!(
++            config
++                .validate(3_000_000.0, 1_575_420_000, 3_000_000)
++                .is_err()
++        );
++    }
++}
+diff --git a/src/gps_sim/pluto_bridge.py b/src/gps_sim/pluto_bridge.py
+new file mode 100644
+--- /dev/null
++++ b/src/gps_sim/pluto_bridge.py
+@@ -0,0 +1,93 @@
++"""Embedded Pluto TX helper. stdin: fixed-size sc8 blocks; stdout: acknowledgements.
++
++This is launched by Rust using an argument list, never a shell. Imports are lazy
++so protocol and error tests can use a fake radio without libiio or hardware.
++"""
++
++import argparse
++import contextlib
++import sys
++import time
++
++BLOCK_BYTES = 262144
++
++
++def read_block(source):
++    """Accumulate short pipe reads; reject a truncated block rather than repeat it."""
++    data = bytearray()
++    while len(data) < BLOCK_BYTES:
++        part = source.read(BLOCK_BYTES - len(data))
++        if not part:
++            if data:
++                raise ValueError("Truncated Pluto IQ block")
++            return None
++        data.extend(part)
++    return data
++
++
++def convert_sc8(data):
++    """Map signed interleaved sc8 to Pluto's signed 16-bit DAC input range."""
++    import numpy as np
++
++    raw = np.frombuffer(data, dtype=np.int8).astype(np.float32)
++    # pyadi-iio takes unnormalised complex values, then casts to int16.
++    # -128 -> -32768; 127 -> 32512. Preserve order, sign and relative amplitude.
++    return (raw[0::2] + 1j * raw[1::2]) * 256.0
++
++
++def stream(radio, source, reply, rate, sleep=time.sleep):
++    """Non-cyclic streaming; one acknowledgement after each successful push."""
++    try:
++        reply("READY")
++        while (data := read_block(source)) is not None:
++            radio.tx(convert_sc8(data))
++            reply("OK")
++        # libiio push can return while the final buffers are still queued.
++        # Allow the bounded kernel queue to drain before destroying the buffer.
++        sleep(4 * (BLOCK_BYTES // 2) / rate)
++    finally:
++        radio.tx_destroy_buffer()
++    reply("DONE")
++
++
++def main():
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--uri", required=True)
++    parser.add_argument("--rate", required=True, type=int)
++    parser.add_argument("--frequency", required=True, type=int)
++    parser.add_argument("--bandwidth", required=True, type=int)
++    parser.add_argument("--gain", required=True, type=float)
++    parser.add_argument("--timeout-ms", required=True, type=int)
++    args = parser.parse_args()
++    protocol = sys.stdout
++
++    def reply(message):
++        print(message, file=protocol, flush=True)
++
++    # Keep dependency/library output out of the machine-readable stdout pipe.
++    with contextlib.redirect_stdout(sys.stderr):
++        import adi
++
++        radio = adi.Pluto(uri=args.uri)
++        try:
++            radio._ctx.set_timeout(args.timeout_ms)
++            radio.tx_enabled_channels = [0]
++            radio.tx_cyclic_buffer = False
++            radio.sample_rate = args.rate
++            radio.tx_lo = args.frequency
++            radio.tx_rf_bandwidth = args.bandwidth
++            radio.tx_hardwaregain_chan0 = args.gain
++            if int(radio.sample_rate) != args.rate:
++                raise ValueError("Pluto sample-rate readback differs from IQ generation rate")
++            stream(radio, sys.stdin.buffer, reply, args.rate)
++        finally:
++            # Also covers failures during configuration; never leave a cyclic TX.
++            radio.tx_destroy_buffer()
++
++
++if __name__ == "__main__":
++    try:
++        main()
++    except Exception as error:
++        print(f"Pluto TX failed: {error}", file=sys.stderr, flush=True)
++        sys.exit(1)
+diff --git a/tests/test_pluto_bridge.py b/tests/test_pluto_bridge.py
+new file mode 100644
+--- /dev/null
++++ b/tests/test_pluto_bridge.py
+@@ -0,0 +1,137 @@
++"""Hardware-free Pluto helper tests. Run: python -m unittest discover -s tests -p test_pluto_bridge.py -v"""
++
++import importlib.util
++import io
++import subprocess
++import sys
++import types
++import unittest
++from pathlib import Path
++from unittest.mock import patch
++
++import numpy as np
++
++HELPER = Path(__file__).resolve().parents[1] / "src/gps_sim/pluto_bridge.py"
++SPEC = importlib.util.spec_from_file_location("pluto_bridge", HELPER)
++bridge = importlib.util.module_from_spec(SPEC)
++SPEC.loader.exec_module(bridge)
++
++
++class FakeRadio:
++    def __init__(self):
++        self.blocks = []
++        self.destroyed = 0
++        self._ctx = types.SimpleNamespace(set_timeout=lambda value: None)
++
++    def tx(self, data):
++        self.blocks.append(data.copy())
++
++    def tx_destroy_buffer(self):
++        self.destroyed += 1
++
++
++class ShortReader(io.BytesIO):
++    def read(self, count=-1):
++        return super().read(min(count, 997))
++
++
++class PlutoBridgeTests(unittest.TestCase):
++    def test_all_signed_values_and_iq_order(self):
++        signed = np.arange(-128, 128, dtype=np.int16).astype(np.int8)
++        result = bridge.convert_sc8(signed.tobytes())
++        np.testing.assert_array_equal(result.real, signed[0::2].astype(np.int16) * 256)
++        np.testing.assert_array_equal(result.imag, signed[1::2].astype(np.int16) * 256)
++        self.assertEqual(result.dtype, np.complex64)
++        self.assertEqual(result[0], complex(-32768, -32512))
++        self.assertEqual(result[-1], complex(32256, 32512))
++
++    def test_short_reads_and_multiple_fresh_blocks(self):
++        radio = FakeRadio()
++        replies, sleeps = [], []
++        data = bytes([1, 255]) * (bridge.BLOCK_BYTES // 2)
++        bridge.stream(radio, ShortReader(data + bytes(bridge.BLOCK_BYTES)), replies.append,
++                      3_000_000, sleep=sleeps.append)
++        self.assertEqual(replies, ["READY", "OK", "OK", "DONE"])
++        self.assertEqual(len(radio.blocks), 2)
++        np.testing.assert_array_equal(radio.blocks[0], 256 - 256j)
++        np.testing.assert_array_equal(radio.blocks[1], 0)
++        self.assertEqual(radio.destroyed, 1)
++        self.assertAlmostEqual(sleeps[0], 4 * 131072 / 3_000_000)
++
++    def test_truncated_input_cleans_up_without_acknowledgement(self):
++        radio, replies = FakeRadio(), []
++        with self.assertRaisesRegex(ValueError, "Truncated"):
++            bridge.stream(radio, io.BytesIO(b"x"), replies.append, 3_000_000)
++        self.assertEqual(replies, ["READY"])
++        self.assertEqual(radio.destroyed, 1)
++
++    def test_tx_failure_cleans_up_without_done(self):
++        radio, replies = FakeRadio(), []
++        radio.tx = lambda samples: (_ for _ in ()).throw(OSError("device disconnected"))
++        with self.assertRaisesRegex(OSError, "disconnected"):
++            bridge.stream(radio, io.BytesIO(bytes(bridge.BLOCK_BYTES)), replies.append, 3_000_000)
++        self.assertEqual(replies, ["READY"])
++        self.assertEqual(radio.destroyed, 1)
++
++    def run_main(self, radio):
++        def open_radio(*, uri):
++            self.assertEqual(uri, "usb:1.2.5")
++            # Library output must not corrupt the protocol.
++            print("libiio diagnostic")
++            return radio
++
++        argv = [str(HELPER), "--uri", "usb:1.2.5", "--rate", "3000000",
++                "--frequency", "1575420000", "--bandwidth", "2500000",
++                "--gain", "-80.5", "--timeout-ms", "5000"]
++        stdout, stderr = io.StringIO(), io.StringIO()
++        stdin = types.SimpleNamespace(buffer=io.BytesIO())
++        with patch.dict(sys.modules, {"adi": types.SimpleNamespace(Pluto=open_radio)}), \
++             patch.object(sys, "argv", argv), patch.object(sys, "stdin", stdin), \
++             patch.object(sys, "stdout", stdout), patch.object(sys, "stderr", stderr):
++            bridge.main()
++        return stdout.getvalue(), stderr.getvalue()
++
++    def test_main_configures_radio_and_separates_diagnostics(self):
++        radio = FakeRadio()
++        stdout, stderr = self.run_main(radio)
++        self.assertEqual(stdout, "READY\nDONE\n")
++        self.assertIn("libiio diagnostic", stderr)
++        self.assertEqual(radio.sample_rate, 3_000_000)
++        self.assertEqual(radio.tx_lo, 1_575_420_000)
++        self.assertEqual(radio.tx_rf_bandwidth, 2_500_000)
++        self.assertEqual(radio.tx_hardwaregain_chan0, -80.5)
++        self.assertFalse(radio.tx_cyclic_buffer)
++        self.assertEqual(radio.tx_enabled_channels, [0])
++        self.assertGreater(radio.destroyed, 0)
++
++    def test_rate_readback_mismatch_is_fatal_and_cleans_up(self):
++        class WrongRate(FakeRadio):
++            @property
++            def sample_rate(self):
++                return 4_000_000
++
++            @sample_rate.setter
++            def sample_rate(self, value):
++                pass
++
++        radio = WrongRate()
++        with self.assertRaisesRegex(ValueError, "readback"):
++            self.run_main(radio)
++        self.assertEqual(radio.blocks, [])
++        self.assertEqual(radio.destroyed, 1)
++
++    def test_missing_dependency_fails_in_subprocess_without_hardware(self):
++        # Isolated mode omits site-packages, guaranteeing no accidental device access.
++        result = subprocess.run(
++            [sys.executable, "-I", "-S", str(HELPER), "--uri", "ip:invalid",
++             "--rate", "3000000", "--frequency", "1575420000", "--bandwidth", "3000000",
++             "--gain", "-80", "--timeout-ms", "1000"],
++            input=b"", capture_output=True, timeout=5, check=False)
++        self.assertNotEqual(result.returncode, 0)
++        self.assertEqual(result.stdout, b"")
++        self.assertIn(b"Pluto TX failed", result.stderr)
++        self.assertIn(b"adi", result.stderr)
++
++
++if __name__ == "__main__":
++    unittest.main()
