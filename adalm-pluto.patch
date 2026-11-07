@@ -198,7 +198,7 @@ index 069ab99..cd34988 100644
                  None
              }
 diff --git a/src/gps_sim/sim.rs b/src/gps_sim/sim.rs
-index 8bf5d36..d38774d 100644
+index 8bf5d36..194e7b4 100644
 --- a/src/gps_sim/sim.rs
 +++ b/src/gps_sim/sim.rs
 @@ -432,19 +432,20 @@ impl SimulatorBuilder {
@@ -225,7 +225,21 @@ index 8bf5d36..d38774d 100644
      ///
      /// When not set, `set_sample_rate_auto` chooses the filter automatically.
      pub fn hackrf_baseband_filter(mut self, hz: u32) -> Self {
-@@ -856,6 +857,10 @@ impl Simulator {
+@@ -853,9 +854,24 @@ impl Simulator {
+             None => None,
+         };
+ 
++        self.dispatch_output(g0, rx_ecef, ieph, istate, log_file)
++    }
++
++    fn dispatch_output(
++        mut self,
++        g0: GpsTime,
++        rx_ecef: [f64; 3],
++        ieph: usize,
++        istate: Option<Arc<Mutex<InteractiveState>>>,
++        log_file: Option<BufWriter<std::fs::File>>,
++    ) -> Result<(), SimError> {
          // Extract the output variant *before* matching so that `self` is not
          // partially moved — replace with a cheap sentinel so the rest of `self`
          // can still be passed by value to the dispatch methods.
@@ -236,7 +250,7 @@ index 8bf5d36..d38774d 100644
          let output = std::mem::replace(&mut self.output, SdrOutput::Null);
  
          match output {
-@@ -865,8 +870,30 @@ impl Simulator {
+@@ -865,8 +881,30 @@ impl Simulator {
              SdrOutput::IqFile { path } => self.run_file(g0, rx_ecef, ieph, &path, istate, log_file),
              SdrOutput::Null => self.run_null(g0, rx_ecef, ieph, istate, log_file),
              SdrOutput::PlutoSdr { host, gain_db } => {
@@ -268,7 +282,7 @@ index 8bf5d36..d38774d 100644
              SdrOutput::UdpStream { addr } => {
                  self.run_udp(g0, rx_ecef, ieph, &addr, istate, log_file)
              }
-@@ -1147,26 +1174,89 @@ impl Simulator {
+@@ -1147,26 +1185,89 @@ impl Simulator {
  
      #[expect(
          clippy::too_many_arguments,
@@ -360,7 +374,7 @@ index 8bf5d36..d38774d 100644
 +            // blocked in acquire() and must wake before it observes stop.
 +            consumer.release(buf);
 +        }
-+        let generated = gps_thread.join().map_err(|_| SimError::Aborted);
++        let generated = gps_thread.join().map_err(|_panic| SimError::Aborted);
 +        result?;
 +        generated?;
 +        tx.finish(&self.stop)?;
