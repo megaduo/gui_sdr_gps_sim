@@ -420,7 +420,7 @@ index 0ec1bc1..f0fc650 100644
              path: settings.iq_file_path.clone(),
          },
 diff --git a/src/ui/sim/settings.rs b/src/ui/sim/settings.rs
-index 9489ed8..2c374db 100644
+index 9489ed8..936b970 100644
 --- a/src/ui/sim/settings.rs
 +++ b/src/ui/sim/settings.rs
 @@ -11,11 +11,13 @@ use crate::ui::widgets::section_title;
@@ -472,7 +472,7 @@ index 9489ed8..2c374db 100644
 +                    ui.horizontal(|ui| {
 +                        ui.label("Python executable:");
 +                        ui.text_edit_singleline(&mut app.sim_pluto.python)
-+                            .on_hover_text("Executable path only; use the Python where pyadi-iio is installed.");
++                            .on_hover_text("auto uses the bundled Pluto runtime; enter an executable path to override.");
 +                    });
 +                    ui.horizontal(|ui| {
 +                        ui.label("Pluto TX gain:");
@@ -483,7 +483,7 @@ index 9489ed8..2c374db 100644
 +                        ui.add(egui::DragValue::new(&mut app.sim_pluto.timeout_ms)
 +                            .range(100..=60_000).suffix(" ms"));
 +                    });
-+                    ui.label("Requires Python, numpy, pyadi-iio and native libiio. See docs/PLUTO.md.");
++                    ui.label("Windows portable builds include Pluto dependencies. Keep pluto-runtime beside the app; Python: auto.");
 +                }
                  crate::simulator::SimOutputType::IqFile => {
                      ui.horizontal(|ui| {
@@ -581,8 +581,24 @@ diff --git a/docs/PLUTO.md b/docs/PLUTO.md
 new file mode 100644
 --- /dev/null
 +++ b/docs/PLUTO.md
-@@ -0,0 +1,132 @@
+@@ -0,0 +1,150 @@
 +# ADALM-Pluto output
++
++## Windows portable build
++
++The **Build Pluto Windows** Actions artifact now includes `pluto-runtime/` with
++portable Python, NumPy, pyadi-iio, matching pylibiio bindings and native libiio DLLs.
++Extract the complete package and keep that directory beside `gui_sdr_gps_sim.exe`.
++Leave **Python executable** set to `auto`. The application resolves the runtime
++relative to its executable, so changing the working directory or moving the
++complete extracted folder does not require editing settings. No system Python
++installation or pip command is needed for this portable build.
++
++An explicitly configured Python path still overrides automatic selection.
++Source builds without the portable runtime fall back to the platform's Python.
++The pinned Python bindings target libiio 0.x; do not replace them independently
++with pylibiio 1.x. The packaging script tests imports from an unrelated directory
++before the artifact is uploaded. This test does not open a radio or transmit.
 +
 +Select **GPS Simulator → Settings → Output Sink → ADALM-Pluto**. The output
 +works with Dynamic, Static and Interactive modes. HackRF remains the default;
@@ -598,7 +614,9 @@ new file mode 100644
 +The application remains Rust-only to build: there are **no new Cargo dependencies,
 +native link requirements or Cargo feature flags**. Pluto is an optional runtime
 +dependency. Its Python helper is embedded in the executable, so there is no
-+separate script to copy next to a release binary.
++separate helper script to copy next to a release binary. The following manual
++setup applies to source builds and custom Python overrides; Windows portable
++artifacts include the runtime described above.
 +
 +Install Python 3.10 or newer, NumPy, Analog Devices' `pyadi-iio` and the native
 +libiio library. `pyadi-iio` installs the Python `pylibiio` bindings, but pip does
@@ -718,15 +736,82 @@ diff --git a/requirements-pluto.txt b/requirements-pluto.txt
 new file mode 100644
 --- /dev/null
 +++ b/requirements-pluto.txt
-@@ -0,0 +1,3 @@
+@@ -0,0 +1,4 @@
 +# Optional runtime dependencies; native libiio must be installed separately.
-+numpy>=1.24,<3
++numpy==2.3.5
 +pyadi-iio==0.0.21
++pylibiio==0.25
+diff --git a/scripts/build_pluto_runtime.py b/scripts/build_pluto_runtime.py
+new file mode 100644
+--- /dev/null
++++ b/scripts/build_pluto_runtime.py
+@@ -0,0 +1,61 @@
++"""Build a relocatable Windows x64 Pluto runtime using official distributions."""
++import hashlib
++import io
++import json
++from pathlib import Path
++import subprocess
++import sys
++import tempfile
++import urllib.request
++import zipfile
++
++ROOT = Path(__file__).resolve().parents[1]
++runtime = Path(sys.argv[1]).resolve()
++runtime.mkdir(parents=True, exist_ok=True)
++sources = {}
++
++
++def download(url):
++    data = urllib.request.urlopen(url, timeout=120).read()
++    sources[url] = hashlib.sha256(data).hexdigest()
++    return data
++
++
++python_url = "https://www.python.org/ftp/python/3.12.10/python-3.12.10-embed-amd64.zip"
++with zipfile.ZipFile(io.BytesIO(download(python_url))) as archive:
++    archive.extractall(runtime)
++
++# Embedded Python resolves these entries relative to its own executable.
++(runtime / "python312._pth").write_text(
++    "python312.zip\n.\nLib/site-packages\nimport site\n", encoding="utf-8")
++(runtime / "sitecustomize.py").write_text(
++    "import os, sys\nfrom pathlib import Path\n"
++    "root = str(Path(sys.executable).resolve().parent)\n"
++    "sys._pluto_dlls = os.add_dll_directory(root)\n"
++    "os.environ['PATH'] = root + os.pathsep + os.environ.get('PATH', '')\n",
++    encoding="utf-8")
++subprocess.run([sys.executable, "-m", "pip", "install", "--only-binary=:all:",
++                "--target", str(runtime / "Lib/site-packages"),
++                "-r", str(ROOT / "requirements-pluto.txt")], check=True)
++
++iio_url = "https://github.com/analogdevicesinc/libiio/releases/download/v0.26/Windows.zip"
++with zipfile.ZipFile(io.BytesIO(download(iio_url))) as archive:
++    for name in archive.namelist():
++        if name.startswith("Windows-VS-2022-x64/") and name.endswith(".dll") and "sharp" not in name:
++            (runtime / Path(name).name).write_bytes(archive.read(name))
++    (runtime / "LIBIIO-README.txt").write_bytes(archive.read("README.txt"))
++license_url = "https://raw.githubusercontent.com/analogdevicesinc/libiio/v0.26/COPYING.txt"
++(runtime / "LIBIIO-LICENSE.txt").write_bytes(download(license_url))
++(runtime / "SOURCES.json").write_text(json.dumps({
++    "download_sha256": sources,
++    "libiio_source": "https://github.com/analogdevicesinc/libiio/tree/v0.26",
++    "python_source": "https://www.python.org/ftp/python/3.12.10/Python-3.12.10.tgz",
++}, indent=2), encoding="utf-8")
++
++# This must succeed without system Python packages, PATH settings or any radio.
++with tempfile.TemporaryDirectory() as directory:
++    subprocess.run([str(runtime / "python.exe"), "-I", "-c",
++                    "import adi, iio, numpy; assert iio.version[:2] == (0, 26); "
++                    "print('Portable Pluto dependencies OK:', adi.__version__, iio.version)"],
++                   cwd=directory, check=True)
++print("Portable Pluto runtime:", runtime)
 diff --git a/src/gps_sim/pluto.rs b/src/gps_sim/pluto.rs
 new file mode 100644
 --- /dev/null
 +++ b/src/gps_sim/pluto.rs
-@@ -0,0 +1,334 @@
+@@ -0,0 +1,369 @@
 +//! Supervised, bounded sc8 pipe to the embedded `pyadi-iio` transmitter.
 +
 +use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -761,7 +846,7 @@ new file mode 100644
 +    fn default() -> Self {
 +        Self {
 +            uri: "ip:192.168.2.1".into(),
-+            python: if cfg!(windows) { "python" } else { "python3" }.into(),
++            python: "auto".into(),
 +            gain_db: -80.0,
 +            timeout_ms: 10_000,
 +        }
@@ -809,6 +894,20 @@ new file mode 100644
 +    }
 +}
 +
++fn resolve_python(requested: &str, executable_dir: &std::path::Path) -> std::path::PathBuf {
++    if !matches!(requested, "auto" | "python" | "python3") {
++        return requested.into();
++    }
++    let bundled = executable_dir.join("pluto-runtime").join("python.exe");
++    if cfg!(windows) && bundled.is_file() {
++        bundled
++    } else if requested == "auto" {
++        if cfg!(windows) { "python" } else { "python3" }.into()
++    } else {
++        requested.into()
++    }
++}
++
 +/// Owns and reaps the helper even on cancellation, timeout, or unwinding.
 +pub(super) struct PlutoTx {
 +    child: Child,
@@ -831,7 +930,11 @@ new file mode 100644
 +        if stop.load(Ordering::Relaxed) {
 +            return Err(SimError::Aborted);
 +        }
-+        let mut command = Command::new(&config.python);
++        let executable = std::env::current_exe()?;
++        let directory = executable
++            .parent()
++            .ok_or_else(|| SimError::Config("Cannot locate application directory".into()))?;
++        let mut command = Command::new(resolve_python(&config.python, directory));
 +        command.args([
 +            "-u",
 +            "-c",
@@ -1015,7 +1118,24 @@ new file mode 100644
 +
 +#[cfg(test)]
 +mod tests {
-+    use super::{PlutoConfig, normalize_uri};
++    use super::{PlutoConfig, normalize_uri, resolve_python};
++
++    #[test]
++    fn explicit_python_is_preserved_and_bundle_is_found() {
++        let directory = tempfile::tempdir().expect("temporary app directory");
++        let bundle = directory.path().join("pluto-runtime");
++        std::fs::create_dir(&bundle).expect("runtime directory");
++        let python = bundle.join("python.exe");
++        std::fs::write(&python, []).expect("runtime executable marker");
++        assert_eq!(
++            resolve_python("custom-python", directory.path()),
++            std::path::PathBuf::from("custom-python")
++        );
++        if cfg!(windows) {
++            assert_eq!(resolve_python("auto", directory.path()), python);
++            assert_eq!(resolve_python("python", directory.path()), python);
++        }
++    }
 +
 +    #[test]
 +    fn accepts_defaults_and_preserves_iio_uris() {
@@ -1065,7 +1185,7 @@ diff --git a/src/gps_sim/pluto_bridge.py b/src/gps_sim/pluto_bridge.py
 new file mode 100644
 --- /dev/null
 +++ b/src/gps_sim/pluto_bridge.py
-@@ -0,0 +1,93 @@
+@@ -0,0 +1,104 @@
 +"""Embedded Pluto TX helper. stdin: fixed-size sc8 blocks; stdout: acknowledgements.
 +
 +This is launched by Rust using an argument list, never a shell. Imports are lazy
@@ -1076,8 +1196,18 @@ new file mode 100644
 +import contextlib
 +import sys
 +import time
++import os
++from pathlib import Path
 +
 +BLOCK_BYTES = 262144
++
++
++def configure_runtime():
++    """Load native libraries beside the portable Python, regardless of CWD."""
++    if sys.platform == "win32":
++        directory = str(Path(sys.executable).resolve().parent)
++        os._pluto_iio_dlls = os.add_dll_directory(directory)
++        os.environ["PATH"] = directory + os.pathsep + os.environ.get("PATH", "")
 +
 +
 +def read_block(source):
@@ -1134,6 +1264,7 @@ new file mode 100644
 +
 +    # Keep dependency/library output out of the machine-readable stdout pipe.
 +    with contextlib.redirect_stdout(sys.stderr):
++        configure_runtime()
 +        import adi
 +
 +        radio = adi.Pluto(uri=args.uri)
