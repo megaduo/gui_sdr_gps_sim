@@ -1,0 +1,67 @@
+name: Build Pluto Windows
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'adalm-pluto.patch'
+      - '.github/workflows/build-pluto.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pluto-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Validate and build Pluto Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply Pluto backend patch
+        shell: bash
+        run: |
+          git apply --check --whitespace=error-all adalm-pluto.patch
+          git apply adalm-pluto.patch
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Hardware-free Python tests
+        run: |
+          python -m pip install "numpy>=1.24,<3"
+          python -m unittest discover -s tests -p test_pluto_bridge.py -v
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: pluto-windows-release
+      - name: Check Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Build Windows release
+        run: cargo build --release --locked
+      - name: Rust regression tests
+        run: cargo test --release --locked --workspace --all-targets --all-features
+      - name: Rust documentation tests
+        run: cargo test --release --locked --workspace --doc
+      - name: Check Rust lints
+        run: cargo clippy --release --locked --workspace --all-targets --all-features -- -D warnings -W clippy::all
+      - name: Package executable and Pluto setup
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path dist/pluto-windows -Force | Out-Null
+          Copy-Item target/release/gui_sdr_gps_sim.exe dist/pluto-windows/
+          Copy-Item LICENSE,requirements-pluto.txt,adalm-pluto.patch dist/pluto-windows/
+          Copy-Item docs/PLUTO.md dist/pluto-windows/PLUTO-SETUP.md
+          "Repository commit: $env:GITHUB_SHA`nPluto patch applied before compilation; Python and native libiio are separate optional runtime dependencies." | Set-Content dist/pluto-windows/BUILD-INFO.txt
+          Compress-Archive -Path dist/pluto-windows/* -DestinationPath dist/gui_sdr_gps_sim-pluto-windows-x86_64.zip
+      - name: Upload Windows build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui_sdr_gps_sim-pluto-windows-x86_64
+          path: dist/gui_sdr_gps_sim-pluto-windows-x86_64.zip
+          if-no-files-found: error
+          retention-days: 30
