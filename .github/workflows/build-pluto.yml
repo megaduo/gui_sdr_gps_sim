@@ -59,7 +59,9 @@ jobs:
           Copy-Item target/release/gui_sdr_gps_sim.exe dist/pluto-windows/
           Copy-Item LICENSE,requirements-pluto.txt,adalm-pluto.patch dist/pluto-windows/
           Copy-Item docs/PLUTO.md dist/pluto-windows/PLUTO-SETUP.md
-          "Repository commit: $env:GITHUB_SHA`nPluto patch applied before compilation; Python and native libiio are separate optional runtime dependencies." | Set-Content dist/pluto-windows/BUILD-INFO.txt
+          python scripts/build_pluto_runtime.py dist/pluto-windows/pluto-runtime
+          if ($LASTEXITCODE -ne 0) { throw "Portable Pluto runtime validation failed" }
+          "Repository commit: $env:GITHUB_SHA`nIncludes portable Python, NumPy, pyadi-iio and native libiio. Keep pluto-runtime beside the executable." | Set-Content dist/pluto-windows/BUILD-INFO.txt
           Compress-Archive -Path dist/pluto-windows/* -DestinationPath dist/gui_sdr_gps_sim-pluto-windows-x86_64.zip
       - name: Upload Windows build
         uses: actions/upload-artifact@v4
