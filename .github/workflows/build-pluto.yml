@@ -26,8 +26,9 @@ jobs:
       - name: Apply Pluto backend patch
         shell: bash
         run: |
-          git apply --check --whitespace=error-all adalm-pluto.patch
-          git apply adalm-pluto.patch
+          python -c "from pathlib import Path; p=Path('adalm-pluto.patch'); p.write_bytes(p.read_bytes().replace(b'\r\n', b'\n'))"
+          git -c core.whitespace=trailing-space,space-before-tab,cr-at-eol apply --check --whitespace=error-all adalm-pluto.patch
+          git -c core.whitespace=trailing-space,space-before-tab,cr-at-eol apply adalm-pluto.patch
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
